@@ -10,7 +10,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use axum::response::IntoResponse;
 use bytes::{BufMut, Bytes, BytesMut};
-use comrak::{ComrakOptions, ComrakPlugins};
+use comrak::{ComrakPlugins, Options};
 use git2::{
     DiffFormat, DiffLineType, DiffOptions, DiffStatsFormat, Email, EmailCreateOptions, ObjectType,
     Oid, Signature, TreeWalkResult,
@@ -65,7 +65,10 @@ impl Git {
         })
         .await
         .context("Failed to join Tokio task")?
-        .context("Failed to open repository")?;
+        .map_err(|err| {
+            error!("{}", err);
+            anyhow!("Failed to open repository")
+        })?;
 
         Ok(Arc::new(OpenRepository {
             git: self,
@@ -433,7 +436,17 @@ fn parse_and_transform_markdown(s: &str, syntax_set: &SyntaxSet) -> String {
     let highlighter = ComrakSyntectAdapter { syntax_set };
     plugins.render.codefence_syntax_highlighter = Some(&highlighter);
 
-    comrak::markdown_to_html_with_plugins(s, &ComrakOptions::default(), &plugins)
+    // enable gfm extensions
+    // https://github.github.com/gfm/
+    let mut options = Options::default();
+    options.extension.autolink = true;
+    options.extension.footnotes = true;
+    options.extension.strikethrough = true;
+    options.extension.table = true;
+    options.extension.tagfilter = true;
+    options.extension.tasklist = true;
+
+    comrak::markdown_to_html_with_plugins(s, &options, &plugins)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
