@@ -11,14 +11,13 @@ mod tree;
 
 use std::{
     collections::BTreeMap,
-    fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use axum::{
-    body::HttpBody,
+    body::Body,
     handler::HandlerWithoutStateExt,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -38,6 +37,7 @@ use self::{
     tag::handle as handle_tag,
     tree::handle as handle_tree,
 };
+use crate::database::schema::tag::YokedString;
 use crate::{
     database::schema::{commit::YokedCommit, tag::YokedTag},
     layers::UnwrapInfallible,
@@ -47,25 +47,11 @@ pub const DEFAULT_BRANCHES: [&str; 2] = ["refs/heads/master", "refs/heads/main"]
 
 // this is some wicked, wicked abuse of axum right here...
 #[allow(clippy::trait_duplication_in_bounds)] // clippy seems a bit.. lost
-pub async fn service<ReqBody>(mut request: Request<ReqBody>) -> Response
-where
-    ReqBody: HttpBody + Send + Debug + 'static,
-    <ReqBody as HttpBody>::Data: Send + Sync,
-    bytes::Bytes: From<ReqBody::Data>,
-    <ReqBody as HttpBody>::Error: std::error::Error + Send + Sync,
-{
+pub async fn service(mut request: Request<Body>) -> Response {
     let scan_path = request
         .extensions()
         .get::<Arc<PathBuf>>()
         .expect("scan_path missing");
-
-    let mut uri_parts: Vec<&str> = request
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .split('/')
-        .collect();
 
     let mut child_path = None;
 
@@ -75,16 +61,35 @@ where
         };
     }
 
-    let mut service = match uri_parts.pop() {
+    let uri = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    let mut uri_parts = memchr::memchr_iter(b'/', uri.as_bytes());
+
+    let original_uri = uri;
+    let (action, mut uri) = if let Some(idx) = uri_parts.next_back() {
+        (uri.get(idx + 1..), &uri[..idx])
+    } else {
+        (None, uri)
+    };
+
+    let mut service = match action {
         Some("about") => h!(handle_about),
-        // TODO: https://man.archlinux.org/man/git-http-backend.1.en
-        // TODO: GIT_PROTOCOL
-        Some("refs") if uri_parts.last() == Some(&"info") => {
-            uri_parts.pop();
-            h!(handle_smart_git)
-        }
         Some("git-upload-pack") => h!(handle_smart_git),
-        Some("refs") => h!(handle_refs),
+        Some("refs") => {
+            if let Some(idx) = uri_parts.next_back() {
+                if uri.get(idx + 1..) == Some("info") {
+                    uri = &uri[..idx];
+                    h!(handle_smart_git)
+                } else {
+                    h!(handle_refs)
+                }
+            } else {
+                h!(handle_refs)
+            }
+        }
         Some("log") => h!(handle_log),
         Some("tree") => h!(handle_tree),
         Some("commit") => h!(handle_commit),
@@ -92,35 +97,26 @@ where
         Some("patch") => h!(handle_patch),
         Some("tag") => h!(handle_tag),
         Some("snapshot") => h!(handle_snapshot),
-        Some(v) => {
-            uri_parts.push(v);
+        Some(_) => {
+            static TREE_FINDER: LazyLock<memchr::memmem::Finder> =
+                LazyLock::new(|| memchr::memmem::Finder::new(b"/tree/"));
+
+            uri = original_uri;
 
             // match tree children
-            if uri_parts.iter().any(|v| *v == "tree") {
-                // TODO: this needs fixing up so it doesn't accidentally match repos that have
-                //  `tree` in their path
-                let mut reconstructed_path = Vec::new();
-
-                while let Some(part) = uri_parts.pop() {
-                    if part == "tree" {
-                        break;
-                    }
-
-                    // TODO: FIXME
-                    reconstructed_path.insert(0, part);
-                }
-
-                child_path = Some(reconstructed_path.into_iter().collect::<PathBuf>().clean());
-
+            if let Some(idx) = TREE_FINDER.find(uri.as_bytes()) {
+                // 6 is the length of /tree/
+                child_path = Some(Path::new(&uri[idx + 6..]).clean());
+                uri = &uri[..idx];
                 h!(handle_tree)
             } else {
                 h!(handle_summary)
             }
         }
-        None => panic!("not found"),
+        None => h!(handle_summary),
     };
 
-    let uri = uri_parts.into_iter().collect::<PathBuf>().clean();
+    let uri = Path::new(uri).clean();
     let path = scan_path.join(&uri);
 
     let db = request
@@ -171,6 +167,14 @@ impl Deref for RepositoryPath {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub struct InvalidRequest;
+
+impl IntoResponse for InvalidRequest {
+    fn into_response(self) -> Response {
+        (StatusCode::NOT_FOUND, "Invalid request").into_response()
+    }
+}
+
 pub struct RepositoryNotFound;
 
 impl IntoResponse for RepositoryNotFound {
@@ -201,5 +205,5 @@ impl IntoResponse for Error {
 
 pub struct Refs {
     heads: BTreeMap<String, YokedCommit>,
-    tags: Vec<(String, YokedTag)>,
+    tags: Vec<(YokedString, YokedTag)>,
 }

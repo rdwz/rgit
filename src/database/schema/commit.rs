@@ -1,10 +1,10 @@
-use std::{borrow::Cow, ops::Deref, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Context;
-use git2::{Oid, Signature};
+use gix::{actor::SignatureRef, ObjectId};
+use rkyv::{Archive, Serialize};
 use rocksdb::{IteratorMode, ReadOptions, WriteBatch};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 use tracing::debug;
 use yoke::{Yoke, Yokeable};
 
@@ -14,34 +14,32 @@ use crate::database::schema::{
     Yoked,
 };
 
-#[derive(Serialize, Deserialize, Debug, Yokeable)]
-pub struct Commit<'a> {
-    #[serde(borrow)]
-    pub summary: Cow<'a, str>,
-    #[serde(borrow)]
-    pub message: Cow<'a, str>,
-    pub author: Author<'a>,
-    pub committer: Author<'a>,
-    pub hash: CommitHash<'a>,
+#[derive(Serialize, Archive, Debug, Yokeable)]
+pub struct Commit {
+    pub summary: String,
+    pub message: String,
+    pub author: Author,
+    pub committer: Author,
+    pub hash: [u8; 20],
 }
 
-impl<'a> Commit<'a> {
+impl Commit {
     pub fn new(
-        commit: &'a git2::Commit<'_>,
-        author: &'a git2::Signature<'_>,
-        committer: &'a git2::Signature<'_>,
-    ) -> Self {
-        Self {
-            summary: commit
-                .summary_bytes()
-                .map_or(Cow::Borrowed(""), String::from_utf8_lossy),
-            message: commit
-                .body_bytes()
-                .map_or(Cow::Borrowed(""), String::from_utf8_lossy),
-            committer: committer.into(),
-            author: author.into(),
-            hash: CommitHash::Oid(commit.id()),
-        }
+        commit: &gix::Commit<'_>,
+        author: SignatureRef<'_>,
+        committer: SignatureRef<'_>,
+    ) -> Result<Self, anyhow::Error> {
+        let message = commit.message()?;
+
+        Ok(Self {
+            summary: message.summary().to_string(),
+            message: message.body.map(ToString::to_string).unwrap_or_default(),
+            committer: committer.try_into()?,
+            author: author.try_into()?,
+            hash: match commit.id().detach() {
+                ObjectId::Sha1(d) => d,
+            },
+        })
     }
 
     pub fn insert(&self, tree: &CommitTree, id: u64, tx: &mut WriteBatch) -> anyhow::Result<()> {
@@ -49,62 +47,30 @@ impl<'a> Commit<'a> {
     }
 }
 
-#[derive(Debug)]
-pub enum CommitHash<'a> {
-    Oid(Oid),
-    Bytes(&'a [u8]),
+#[derive(Serialize, Archive, Debug)]
+pub struct Author {
+    pub name: String,
+    pub email: String,
+    pub time: (i64, i32),
 }
 
-impl<'a> Deref for CommitHash<'a> {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            CommitHash::Oid(v) => v.as_bytes(),
-            CommitHash::Bytes(v) => v,
-        }
+impl ArchivedAuthor {
+    pub fn time(&self) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(self.time.0.to_native())
+            .unwrap()
+            .to_offset(UtcOffset::from_whole_seconds(self.time.1.to_native()).unwrap())
     }
 }
 
-impl Serialize for CommitHash<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            CommitHash::Oid(v) => serializer.serialize_bytes(v.as_bytes()),
-            CommitHash::Bytes(v) => serializer.serialize_bytes(v),
-        }
-    }
-}
+impl TryFrom<SignatureRef<'_>> for Author {
+    type Error = anyhow::Error;
 
-impl<'a, 'de: 'a> Deserialize<'de> for CommitHash<'a> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let bytes = <&'a [u8]>::deserialize(deserializer)?;
-        Ok(Self::Bytes(bytes))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Author<'a> {
-    #[serde(borrow)]
-    pub name: Cow<'a, str>,
-    #[serde(borrow)]
-    pub email: Cow<'a, str>,
-    pub time: OffsetDateTime,
-}
-
-impl<'a> From<&'a git2::Signature<'_>> for Author<'a> {
-    fn from(author: &'a Signature<'_>) -> Self {
-        Self {
-            name: String::from_utf8_lossy(author.name_bytes()),
-            email: String::from_utf8_lossy(author.email_bytes()),
-            // TODO: this needs to deal with offset
-            time: OffsetDateTime::from_unix_timestamp(author.when().seconds()).unwrap(),
-        }
+    fn try_from(author: SignatureRef<'_>) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            name: author.name.to_string(),
+            email: author.email.to_string(),
+            time: (author.time.seconds, author.time.offset),
+        })
     }
 }
 
@@ -113,7 +79,7 @@ pub struct CommitTree {
     pub prefix: Box<[u8]>,
 }
 
-pub type YokedCommit = Yoked<Commit<'static>>;
+pub type YokedCommit = Yoked<&'static <Commit as Archive>::Archived>;
 
 impl CommitTree {
     pub(super) fn new(db: Arc<rocksdb::DB>, repository: RepositoryId, reference: &str) -> Self {
@@ -168,12 +134,11 @@ impl CommitTree {
             return Ok(0);
         };
 
-        let mut out = [0_u8; std::mem::size_of::<u64>()];
-        out.copy_from_slice(&res);
+        let out: [u8; std::mem::size_of::<u64>()] = res.as_ref().try_into()?;
         Ok(u64::from_be_bytes(out))
     }
 
-    fn insert(&self, id: u64, commit: &Commit<'_>, tx: &mut WriteBatch) -> anyhow::Result<()> {
+    fn insert(&self, id: u64, commit: &Commit, tx: &mut WriteBatch) -> anyhow::Result<()> {
         let cf = self
             .db
             .cf_handle(COMMIT_FAMILY)
@@ -182,7 +147,7 @@ impl CommitTree {
         let mut key = self.prefix.to_vec();
         key.extend_from_slice(&id.to_be_bytes());
 
-        tx.put_cf(cf, key, bincode::serialize(commit)?);
+        tx.put_cf(cf, key, rkyv::to_bytes::<rkyv::rancor::Error>(commit)?);
 
         Ok(())
     }
@@ -200,9 +165,11 @@ impl CommitTree {
             return Ok(None);
         };
 
-        Yoke::try_attach_to_cart(Box::from(value), |data| bincode::deserialize(data))
-            .map(Some)
-            .context("Failed to deserialize commit")
+        Yoke::try_attach_to_cart(Box::from(value), |value| {
+            rkyv::access::<_, rkyv::rancor::Error>(value)
+        })
+        .context("Failed to deserialize commit")
+        .map(Some)
     }
 
     pub fn fetch_latest(
@@ -238,7 +205,7 @@ impl CommitTree {
             .iterator_cf_opt(cf, opts, IteratorMode::End)
             .map(|v| {
                 Yoke::try_attach_to_cart(v.context("failed to read commit")?.1, |data| {
-                    bincode::deserialize(data).context("failed to deserialize")
+                    rkyv::access::<_, rkyv::rancor::Error>(data).context("failed to deserialize")
                 })
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()

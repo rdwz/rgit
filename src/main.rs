@@ -3,10 +3,11 @@
 use std::{
     borrow::Cow,
     fmt::{Display, Formatter},
+    future::IntoFuture,
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -20,22 +21,22 @@ use axum::{
     routing::get,
     Extension, Router,
 };
-use bat::assets::HighlightingAssets;
 use clap::Parser;
+use const_format::formatcp;
 use database::schema::SCHEMA_VERSION;
-use nom::AsBytes;
-use once_cell::sync::{Lazy, OnceCell};
 use rocksdb::{Options, SliceTransform};
-use sha2::{digest::FixedOutput, Digest};
-use syntect::html::ClassStyle;
 use tokio::{
+    net::TcpListener,
     signal::unix::{signal, SignalKind},
     sync::mpsc,
 };
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer};
 use tower_layer::layer_fn;
 use tracing::{error, info, instrument, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
+use xxhash_rust::const_xxh3;
 
 use crate::{
     database::schema::prefixes::{
@@ -43,6 +44,8 @@ use crate::{
     },
     git::Git,
     layers::logger::LoggingMiddleware,
+    syntax_highlight::prime_highlighters,
+    theme::Theme,
 };
 
 mod database;
@@ -50,21 +53,25 @@ mod git;
 mod layers;
 mod methods;
 mod syntax_highlight;
+mod theme;
+mod unified_diff_builder;
 
 const CRATE_VERSION: &str = clap::crate_version!();
 
-static GLOBAL_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/statics/css/style.css",));
-static GLOBAL_CSS_HASH: Lazy<Box<str>> = Lazy::new(|| build_asset_hash(GLOBAL_CSS));
+const GLOBAL_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/statics/css/style.css"));
+const GLOBAL_CSS_HASH: &str = const_hex::Buffer::<16, false>::new()
+    .const_format(&const_xxh3::xxh3_128(GLOBAL_CSS).to_be_bytes())
+    .as_str();
 
-static HIGHLIGHT_CSS_HASH: OnceCell<Box<str>> = OnceCell::new();
-static DARK_HIGHLIGHT_CSS_HASH: OnceCell<Box<str>> = OnceCell::new();
+static HIGHLIGHT_CSS_HASH: OnceLock<Box<str>> = OnceLock::new();
+static DARK_HIGHLIGHT_CSS_HASH: OnceLock<Box<str>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 pub struct Args {
-    /// Path to a directory in which the RocksDB database should be stored, will be created if it doesn't already exist
+    /// Path to a directory in which the `RocksDB` database should be stored, will be created if it doesn't already exist
     ///
-    /// The RocksDB database is very quick to generate, so this can be pointed to temporary storage
+    /// The `RocksDB` database is very quick to generate, so this can be pointed to temporary storage
     #[clap(short, long, value_parser)]
     db_store: PathBuf,
     /// The socket address to bind to (eg. 0.0.0.0:3333)
@@ -74,6 +81,9 @@ pub struct Args {
     /// Configures the metadata refresh interval (eg. "never" or "60s")
     #[clap(long, default_value_t = RefreshInterval::Duration(Duration::from_secs(300)))]
     refresh_interval: RefreshInterval,
+    /// Configures the request timeout.
+    #[clap(long, default_value_t = Duration::from_secs(10).into())]
+    request_timeout: humantime::Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +116,7 @@ impl FromStr for RefreshInterval {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), anyhow::Error> {
     let args: Args = Args::parse();
 
@@ -113,39 +124,44 @@ async fn main() -> Result<(), anyhow::Error> {
         std::env::set_var("RUST_LOG", "info");
     }
 
-    let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
-    #[cfg(debug_assertions)]
-    let subscriber = subscriber.pretty();
-    subscriber.init();
+    let logger_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
+    let env_filter = EnvFilter::from_default_env();
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(logger_layer)
+        .init();
 
     let db = open_db(&args)?;
 
     let indexer_wakeup_task =
         run_indexer(db.clone(), args.scan_path.clone(), args.refresh_interval);
 
-    let bat_assets = HighlightingAssets::from_binary();
-    let syntax_set = bat_assets.get_syntax_set().unwrap().clone();
+    let css = {
+        let theme = basic_toml::from_str::<Theme>(include_str!("../themes/github_light.toml"))
+            .unwrap()
+            .build_css();
+        let css = Box::leak(
+            format!(r#"@media (prefers-color-scheme: light){{{theme}}}"#)
+                .into_boxed_str()
+                .into_boxed_bytes(),
+        );
+        HIGHLIGHT_CSS_HASH.set(build_asset_hash(css)).unwrap();
+        css
+    };
 
-    let theme = bat_assets.get_theme("GitHub");
-    let css = syntect::html::css_for_theme_with_class_style(theme, ClassStyle::Spaced).unwrap();
-    let css = Box::leak(
-        format!(r#"@media (prefers-color-scheme: light){{{css}}}"#)
-            .into_boxed_str()
-            .into_boxed_bytes(),
-    );
-    HIGHLIGHT_CSS_HASH.set(build_asset_hash(css)).unwrap();
-
-    let dark_theme = bat_assets.get_theme("TwoDark");
-    let dark_css =
-        syntect::html::css_for_theme_with_class_style(dark_theme, ClassStyle::Spaced).unwrap();
-    let dark_css = Box::leak(
-        format!(r#"@media (prefers-color-scheme: dark){{{dark_css}}}"#)
-            .into_boxed_str()
-            .into_boxed_bytes(),
-    );
-    DARK_HIGHLIGHT_CSS_HASH
-        .set(build_asset_hash(dark_css))
-        .unwrap();
+    let dark_css = {
+        let theme = basic_toml::from_str::<Theme>(include_str!("../themes/onedark.toml"))
+            .unwrap()
+            .build_css();
+        let css = Box::leak(
+            format!(r#"@media (prefers-color-scheme: dark){{{theme}}}"#)
+                .into_boxed_str()
+                .into_boxed_bytes(),
+        );
+        DARK_HIGHLIGHT_CSS_HASH.set(build_asset_hash(css)).unwrap();
+        css
+    };
 
     let static_favicon = |content: &'static [u8]| {
         move || async move {
@@ -169,10 +185,14 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
+    info!("Priming highlighters...");
+    prime_highlighters();
+    info!("Server starting up...");
+
     let app = Router::new()
         .route("/", get(methods::index::handle))
         .route(
-            &format!("/style-{}.css", *GLOBAL_CSS_HASH),
+            formatcp!("/style-{}.css", GLOBAL_CSS_HASH),
             get(static_css(GLOBAL_CSS)),
         )
         .route(
@@ -191,14 +211,16 @@ async fn main() -> Result<(), anyhow::Error> {
             get(static_favicon(include_bytes!("../statics/favicon.ico"))),
         )
         .fallback(methods::repo::service)
+        .layer(TimeoutLayer::new(args.request_timeout.into()))
         .layer(layer_fn(LoggingMiddleware))
-        .layer(Extension(Arc::new(Git::new(syntax_set))))
+        .layer(Extension(Arc::new(Git::new())))
         .layer(Extension(db))
         .layer(Extension(Arc::new(args.scan_path)))
         .layer(CorsLayer::new());
 
-    let server = axum::Server::bind(&args.bind_address)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    let listener = TcpListener::bind(&args.bind_address).await?;
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    let server = axum::serve(listener, app).into_future();
 
     tokio::select! {
         res = server => res.context("failed to run server"),
@@ -219,7 +241,7 @@ fn open_db(args: &Args) -> Result<Arc<rocksdb::DB>, anyhow::Error> {
         let mut commit_family_options = Options::default();
         commit_family_options.set_prefix_extractor(SliceTransform::create(
             "commit_prefix",
-            |input| input.split(|&c| c == b'\0').next().unwrap_or(input),
+            |input| memchr::memchr(b'\0', input).map_or(input, |idx| &input[..idx]),
             None,
         ));
 
@@ -241,7 +263,7 @@ fn open_db(args: &Args) -> Result<Arc<rocksdb::DB>, anyhow::Error> {
         )?;
 
         let needs_schema_regen = match db.get("schema_version")? {
-            Some(v) if v.as_bytes() != SCHEMA_VERSION.as_bytes() => Some(Some(v)),
+            Some(v) if v.as_slice() != SCHEMA_VERSION.as_bytes() => Some(Some(v)),
             Some(_) => None,
             None => {
                 db.put("schema_version", SCHEMA_VERSION)?;
@@ -285,7 +307,7 @@ async fn run_indexer(
         let mut sighup = signal(SignalKind::hangup()).expect("could not subscribe to sighup");
         let build_sleeper = move || async move {
             match refresh_interval {
-                RefreshInterval::Never => futures::future::pending().await,
+                RefreshInterval::Never => futures_util::future::pending().await,
                 RefreshInterval::Duration(v) => tokio::time::sleep(v).await,
             };
         };
@@ -308,10 +330,8 @@ async fn run_indexer(
 
 #[must_use]
 pub fn build_asset_hash(v: &[u8]) -> Box<str> {
-    let mut hasher = sha2::Sha256::default();
-    hasher.update(v);
-    let mut out = hex::encode(hasher.finalize_fixed());
-    out.truncate(10);
+    let hasher = const_xxh3::xxh3_128(v);
+    let out = const_hex::encode(hasher.to_be_bytes());
     Box::from(out)
 }
 
